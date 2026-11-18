@@ -129,7 +129,96 @@ const bodyText = $("beam-body").textContent;
 check("零概率样例无 NaN", !bodyText.includes("NaN"), bodyText.slice(0, 120));
 check("零概率样例显示 -∞", bodyText.includes("-∞") || $("frame-probs").textContent.includes("0.000"));
 
-// 10. no uncaught UI errors
+// 10. no uncaught UI errors so far
+check("此前无未捕获脚本错误", errors.length === 0, errors.join(" | ").slice(0, 200));
+
+// ===========================================================================
+// 11. two-segment duplicate-check panel
+// ===========================================================================
+// Use the duplicate pair demo: its frames_a doubles as a fresh session.
+const pairSamples = await (await fetch(new URL("/api/compare-samples", BASE))).json();
+check("对读样例接口可用", pairSamples.samples.length >= 2, pairSamples.samples.map((s) => s.name).join(","));
+const dupSample = await (
+  await fetch(new URL("/api/compare-samples/pair_duplicate.json", BASE))
+).json();
+// Create a matching-vocabulary session through the API and adopt it in the
+// page via the explicit test hook, then drive the real UI to advance frames.
+const pairSession = await (
+  await fetch(new URL("/api/sessions", BASE), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ vocab: dupSample.vocab, beam_width: 4, frames: dupSample.frames_a }),
+  })
+).json();
+window.CTC_WORKBENCH.__testAdoptSession(pairSession, "pair_duplicate");
+await until(() => !$("workspace").hidden, "pair session adopted");
+$("run-btn").click();
+await until(
+  () => $("progress-text").textContent.startsWith(`${dupSample.frames_a.length} / ${dupSample.frames_a.length}`),
+  "advance pair session",
+  30000,
+);
+await until(() => $("stop-btn").hidden, "run loop finished 2");
+
+check("对读面板存在", !!$("compare-panel"));
+await until(() => $("cmp-sample-buttons").children.length >= 2, "compare sample buttons");
+check("对读样例按钮已渲染", $("cmp-sample-buttons").children.length >= 2);
+check("未选 B 段时对读按钮禁用", $("cmp-run").disabled);
+
+const dupBtn = [...$("cmp-sample-buttons").children].find((b) => b.textContent.includes("重复采集"));
+dupBtn.click();
+await sleep(200);
+check("载入对读样例后按钮可用", !$("cmp-run").disabled, `range=${$("cmp-range-out").textContent}`);
+$("cmp-run").click();
+await until(() => !$("cmp-result").hidden && $("cmp-summary").children.length > 0, "compare result");
+check("对读结果区显示", !$("cmp-result").hidden);
+const verdict = $("cmp-summary").children[0].textContent;
+check("重复样例结论可对应", verdict.includes("可对应"), verdict);
+const simText = $("cmp-summary").children[1].textContent;
+check("相似度为 0~1 数值", /\d\.\d{4}/.test(simText), simText);
+check("重复样例无冲突", $("cmp-conflicts").children.length === 0, $("cmp-conflicts").textContent);
+check("事件对应表非空", $("cmp-pairs-body").children.length >= 1);
+check("对齐路径默认收起", $("cmp-align").hidden);
+$("cmp-align-toggle").click();
+check("展开对齐路径", !$("cmp-align").hidden && $("cmp-align").children.length > 0);
+$("cmp-align-toggle").click();
+check("再次收起对齐路径", $("cmp-align").hidden);
+check("未显示过期横幅", $("cmp-banner").hidden);
+
+// Advancing is impossible at the end; switch the A range instead to force expiry.
+const oldEnd = Number($("cmp-end").value);
+$("cmp-start").value = String(Math.max(0, oldEnd - 10));
+$("cmp-start").dispatchEvent(new window.Event("input"));
+await sleep(100);
+check("更换 A 段区间后旧结果标过期", !$("cmp-banner").hidden && $("cmp-banner").textContent.includes("结果已过期"),
+  $("cmp-banner").textContent.slice(0, 60));
+check("过期横幅含原帧范围", /帧范围/.test($("cmp-banner").textContent));
+
+// Conflict demo must surface conflicts rather than a similarity verdict.
+const conBtn = [...$("cmp-sample-buttons").children].find((b) => b.textContent.includes("冲突"));
+conBtn.click();
+await sleep(150);
+$("cmp-run").click();
+await until(() => $("cmp-conflicts").children.length > 0, "conflict result");
+check("冲突样例列出冲突事件", $("cmp-conflicts").children.length > 0, $("cmp-conflicts").textContent.slice(0, 80));
+check("冲突样例结论为冲突", $("cmp-summary").children[0].textContent.includes("冲突"));
+check("新结果不再显示过期", $("cmp-banner").hidden);
+
+// A failed comparison (all-zero B frame via an uploaded file) keeps the old result.
+const zeroFrames = [...dupSample.frames_b.slice(0, -1), [0, 0, 0, 0]];
+const zeroFile = new window.File([JSON.stringify({ frames: zeroFrames })], "zero.json", {
+  type: "application/json",
+});
+const cmpFile = $("cmp-b-file");
+Object.defineProperty(cmpFile, "files", { value: [zeroFile], configurable: true });
+cmpFile.dispatchEvent(new window.Event("change"));
+await sleep(100);
+$("cmp-run").click();
+await until(() => !$("cmp-error").hidden && $("cmp-error").textContent.includes("全零帧"), "zero B error");
+check("全零帧报错并保留上次结果", $("cmp-error").textContent.includes("保留上次结果"), $("cmp-error").textContent);
+check("报错后旧结果仍在屏幕上", !$("cmp-result").hidden && $("cmp-conflicts").children.length > 0);
+
+// 12. no uncaught UI errors
 check("无未捕获脚本错误", errors.length === 0, errors.join(" | ").slice(0, 200));
 
 const failed = results.filter((r) => !r.ok);

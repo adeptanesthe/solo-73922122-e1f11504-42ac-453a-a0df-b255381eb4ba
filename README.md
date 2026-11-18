@@ -1,9 +1,10 @@
 # 流式 CTC 解码工作台
 
 面向语音算法工程师的本地网页工具：上传词表与声学模型逐帧概率，按束宽做 CTC
-前缀束搜索，分块推进，随时确认 / 撤销字幕前缀，并查看每条候选的对数概率。
+前缀束搜索，分块推进，随时确认 / 撤销字幕前缀，并查看每条候选的对数概率；
+另提供**双片段对读**，用于核对两段录音是否为重复采集。
 
-- 后端：FastAPI + NumPy（CTC 前缀束搜索为纯 Python/NumPy 实现，无需下载模型）
+- 后端：FastAPI + NumPy（CTC 前缀束搜索与对读算法均为纯 Python/NumPy 实现，无需下载模型）
 - 前端：单个静态页面（原生 JS，无构建步骤）
 - 部署：`docker compose up` 即可访问 <http://localhost:8000>
 
@@ -38,6 +39,37 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
    兼容候选，后续推进不会再把不兼容路径带回束中。
 5. **撤销确认**：恢复「未做该次确认时」在当前帧应有的束与分数（不是简单解除文字限制），
    已推进的帧不会回退。
+6. **双片段对读**：在第 5 面板从**已推进帧**中选择连续 8～64 帧作为 A 段，上传同词表的
+   另一段 8～64 帧概率作为 B 段（或点击内置对读样例），核对两段是否为重复采集。
+
+## 双片段对读的判定语义
+
+对读只采信**发音事件**，blank 帧永远不会成为「重复」的证据。完整流水线见
+`app/compare.py`：
+
+1. **逐帧归一化**：每帧除以自身之和。出现全零帧时无法归一化，接口返回 400 并提示
+   「已保留上次对读结果」，前端不改动已有结论。
+2. **事件抽取**：归一化后某个非 blank 类概率 **≥ 0.8** 的帧才记为发音帧；连续同字帧合并为
+   一个事件，只有中间出现 **blank 占优帧**（argmax 为 blank）时，同字才算两次发音；
+   没有任何类别过阈值的帧只算「模糊帧」，不会切分事件。
+3. **单调对齐**：在帧网格上做只允许 `(1,1)/(1,0)/(0,1)` 的 DTW，且禁止两个连续的同轴
+   移动（局部 Sakoe-Chiba 斜率 2 约束），任一侧局部速度都不超过 2 倍。事件帧与不同字
+   对齐代价最高，因此高置信事件无法靠 blank 路径被悄悄跳过。
+4. **事件对应与冲突**：把对齐路径投影到事件上，要求一一且同字对应。事件被跳过、一对多、
+   异字对应或事件帧跨度比超过 2 倍都列为冲突；长度比超过 2 倍、不存在合法对齐路径时直接
+   判为冲突。
+5. **相似度（0～1）**：仅由事件证据组成——字标一致占 0.6，时序占 0.3（局部速度与事件中心
+   在归一化时间轴上的位置各半），事件平均置信度占 0.1。任一侧没有发音事件时返回
+   「证据不足」且相似度为 `null`，大量 blank 不会抬高相似度。
+
+### 过期与迟到结果
+
+- 每次对读请求带 `request_id`，前端只接受最新一次请求的响应，迟到响应直接丢弃，不会覆盖
+  新结果。
+- 结果记录计算时的会话 `revision` 与 A 段帧范围；推进帧、切换会话或改动区间后，旧结果
+  保留在页面上并显示「结果已过期」横幅，标明原帧范围。
+- 对读失败（全零帧、坏 JSON、区间越界等）只显示错误，旧结果原样保留；对读接口不修改
+  解码会话。
 
 ## 关键语义与实现
 
@@ -90,7 +122,10 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/peek` | `{session_id, frame}` 回放已推进帧的候选 |
 | POST | `/api/confirm` | `{session_id, prefix}` 延长已确认前缀 |
 | POST | `/api/undo` | 撤销最近一次确认 |
+| POST | `/api/compare` | 双片段对读：`{session_id, start_frame, end_frame, frames_b, request_id?}` |
+| POST | `/api/compare/upload` | multipart 上传 B 段文件的对读入口 |
 | GET | `/api/samples`、`/api/samples/{name}` | 内置样例 |
+| GET | `/api/compare-samples`、`/api/compare-samples/{name}` | 内置对读样例（`samples/pairs`） |
 
 状态中的 `beams[].logp_blank` / `logp_nonblank` 为 `null` 表示 `-∞`（JSON 无 `-Infinity`）。
 `prefix_scores` 是确认时记录的末字 blank / 非 blank 路径概率（以及完整前缀分数
@@ -99,8 +134,9 @@ python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ## 测试
 
 ```bash
-python3 -m pytest -q tests            # 单元 + HTTP + 并发排序测试（37 项）
-python3 scripts/make_samples.py       # 重新生成内置样例
+python3 -m pytest -q tests            # 单元 + HTTP + 并发 + 对读算法/接口测试（75 项）
+python3 scripts/make_samples.py       # 重新生成内置解码样例
+python3 scripts/make_pair_samples.py  # 重新生成内置对读样例
 ```
 
 可选的浏览器级冒烟测试（需要 jsdom，在服务已启动时执行）：
@@ -111,7 +147,8 @@ JSDOM_DIR=/tmp/uitest node tests/ui_smoke.mjs http://127.0.0.1:8000
 ```
 
 该脚本使用 jsdom 驱动真实页面，覆盖：样例载入、分块推进、确认前缀、撤销后进度保留、
-非法确认的错误提示、历史帧只读回放、连续推进到结尾、零概率样例不出现 NaN。
+非法确认的错误提示、历史帧只读回放、连续推进到结尾、零概率样例不出现 NaN，以及双片段
+对读的高相似度结论、冲突事件、对齐路径展开、区间变更后的过期标记、全零帧失败保留旧结果。
 
 ## 内置样例
 
@@ -120,6 +157,8 @@ JSDOM_DIR=/tmp/uitest node tests/ui_smoke.mjs http://127.0.0.1:8000
 | `samples/sample_repeat.json` | 连续同字、blank 分隔后的重复字符 |
 | `samples/sample_blank_heavy.json` | 大量 blank 帧中间夹短音 |
 | `samples/sample_sparse_zero.json` | 含 `0` 概率（`-∞`），界面不出现 NaN |
+| `samples/pairs/pair_duplicate.json` | 对读：事件一一对应、节奏略变，应判高相似度无冲突 |
+| `samples/pairs/pair_conflict.json` | 对读：同位置异字与事件跳过，必须报冲突而非判重复 |
 
 ## 已知限制
 
@@ -127,3 +166,5 @@ JSDOM_DIR=/tmp/uitest node tests/ui_smoke.mjs http://127.0.0.1:8000
 - 束搜索为纯 Python 循环，2000 帧 × 束宽 16 约需 1.5 秒，期间通过单线程队列串行处理；
   未做多进程并行。
 - 页面只接受 UTF-8 编码的 JSON/文本文件，单文件大小受反向代理默认限制。
+- 对读固定在 8～64 帧的小片段上，DTW 为 `O(n·m)` 的纯 Python 网格；超出该长度的片段
+  需要先切分再逐段核对。

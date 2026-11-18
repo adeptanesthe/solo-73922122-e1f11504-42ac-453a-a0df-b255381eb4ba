@@ -690,4 +690,517 @@
   loadSamples();
   updateButtons();
   updateStatusFromSnapshot();
+
+  // Shared hook for the separate two-segment comparison module: it needs the
+  // live session id, the displayed revision and a way to know when the stream
+  // advances so it can mark an old comparison result as expired.
+  window.CTC_WORKBENCH = {
+    getSession: () => ({
+      sessionId: state.sessionId,
+      generation: state.generation,
+      revision: state.revision,
+      snapshot: state.snapshot,
+    }),
+    // Fired after every accepted state snapshot (advance / confirm / undo).
+    onSnapshot: null,
+    // Test-only escape hatch: adopt a session payload created directly through
+    // the API, as if the setup flow had returned it.  Not used by product code.
+    __testAdoptSession: (payload, sampleName = null) => startSession(payload, sampleName),
+  };
+  const originalApplyState = applyState;
+  applyState = function (payload, opts) {
+    const applied = originalApplyState(payload, opts);
+    if (applied && typeof window.CTC_WORKBENCH.onSnapshot === "function") {
+      window.CTC_WORKBENCH.onSnapshot(payload);
+    }
+    return applied;
+  };
+})();
+
+/* Two-segment duplicate-recording check.
+ *
+ * Staleness rules (mirrors the backend's request_id / revision discipline):
+ * - every comparison request carries a client-generated request_id; a late
+ *   response whose id is not the latest one is discarded and never rendered;
+ * - the result remembers the session revision and the A-segment frame range it
+ *   was computed for.  Advancing frames, switching sessions or changing the
+ *   selection marks the rendered result as "expired" while keeping it on
+ *   screen, and annotates it with its original frame range;
+ * - a failed comparison (all-zero frames, bad JSON, range error) keeps the
+ *   previous result untouched and only shows an error message.
+ */
+(() => {
+  "use strict";
+
+  const $ = (id) => document.getElementById(id);
+  const els = {
+    panel: $("compare-panel"),
+    start: $("cmp-start"),
+    end: $("cmp-end"),
+    rangeOut: $("cmp-range-out"),
+    rangeHint: $("cmp-range-hint"),
+    bFile: $("cmp-b-file"),
+    run: $("cmp-run"),
+    samples: $("cmp-sample-buttons"),
+    error: $("cmp-error"),
+    result: $("cmp-result"),
+    banner: $("cmp-banner"),
+    summary: $("cmp-summary"),
+    reason: $("cmp-reason"),
+    pairsBody: $("cmp-pairs-body"),
+    pairsEmpty: $("cmp-pairs-empty"),
+    conflicts: $("cmp-conflicts"),
+    conflictsEmpty: $("cmp-conflicts-empty"),
+    alignToggle: $("cmp-align-toggle"),
+    align: $("cmp-align"),
+    meta: $("cmp-meta"),
+  };
+
+  const cstate = {
+    requestSeq: 0,          // monotonic; older responses are dropped
+    lastRequestId: null,
+    result: null,           // last successfully rendered comparison payload
+    // Context the rendered result was computed for.
+    ctx: null,              // { sessionId, generation, revision, start, end, bFileName }
+    expired: false,
+    sampleB: null,          // frames_b loaded from a bundled demo, if any
+  };
+
+  const MIN_FRAMES = 8;
+  const MAX_FRAMES = 64;
+
+  function api(path, options = {}) {
+    return window
+      .fetch(path, { headers: { "Content-Type": "application/json" }, ...options })
+      .then(async (response) => {
+        let payload = null;
+        try { payload = await response.json(); } catch { payload = null; }
+        if (!response.ok) {
+          const detail = payload && payload.detail ? payload.detail : `HTTP ${response.status}`;
+          const err = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+          err.status = response.status;
+          throw err;
+        }
+        return payload;
+      });
+  }
+
+  function showError(message) {
+    if (!message) { els.error.hidden = true; els.error.textContent = ""; return; }
+    els.error.hidden = false;
+    els.error.textContent = message;
+  }
+
+  function currentSession() {
+    const hook = window.CTC_WORKBENCH;
+    return hook ? hook.getSession() : { sessionId: null, snapshot: null };
+  }
+
+  // ------------------------------------------------------------- range inputs
+
+  function syncRangeLimits() {
+    const { snapshot } = currentSession();
+    const total = snapshot ? snapshot.frame_count : 0;
+    const done = snapshot ? snapshot.next_frame : 0;
+    els.start.max = String(Math.max(0, done));
+    els.end.max = String(done);
+    if (Number(els.start.value) > done) els.start.value = String(Math.max(0, done - MIN_FRAMES));
+    if (Number(els.end.value) > done || Number(els.end.value) === 0) {
+      els.end.value = String(Math.min(done, total));
+    }
+    clampRange();
+  }
+
+  function clampRange() {
+    const { snapshot } = currentSession();
+    const done = snapshot ? snapshot.next_frame : 0;
+    let s = Number(els.start.value);
+    let e = Number(els.end.value);
+    s = Math.max(0, Math.min(s, done));
+    e = Math.max(0, Math.min(e, done));
+    if (e - s < MIN_FRAMES) {
+      e = Math.min(done, s + MIN_FRAMES);
+      if (e - s < MIN_FRAMES) s = Math.max(0, e - MIN_FRAMES);
+    }
+    if (e - s > MAX_FRAMES) e = s + MAX_FRAMES;
+    els.start.value = String(s);
+    els.end.value = String(e);
+    const len = e - s;
+    els.rangeOut.textContent = `${s} – ${e}（${len} 帧）`;
+    updateRunButton();
+    markExpiredIfChanged();
+  }
+
+  function hasBSource() {
+    return !!cstate.sampleB || !!els.bFile.files[0];
+  }
+
+  function updateRunButton() {
+    const { sessionId, snapshot } = currentSession();
+    const done = snapshot ? snapshot.next_frame : 0;
+    const len = Number(els.end.value) - Number(els.start.value);
+    els.run.disabled =
+      !sessionId || done < MIN_FRAMES || len < MIN_FRAMES || len > MAX_FRAMES || !hasBSource();
+    if (done < MIN_FRAMES) {
+      els.rangeHint.textContent = `已推进 ${done} 帧；A 段至少需要 ${MIN_FRAMES} 帧，请先推进。`;
+    } else {
+      els.rangeHint.textContent = "只能选择已经推进过的帧；换区间后旧结果会标记为过期。";
+    }
+  }
+
+  // --------------------------------------------------------------- staleness
+
+  function markExpiredIfChanged() {
+    if (!cstate.result || cstate.expired) return;
+    const { sessionId, generation, snapshot } = currentSession();
+    const s = Number(els.start.value);
+    const e = Number(els.end.value);
+    const ctx = cstate.ctx;
+    const stale =
+      ctx.generation !== generation ||
+      ctx.sessionId !== sessionId ||
+      ctx.start !== s ||
+      ctx.end !== e ||
+      (snapshot && ctx.revision !== snapshot.revision);
+    if (stale) setExpired(true);
+  }
+
+  function setExpired(on) {
+    cstate.expired = on;
+    renderBanner();
+  }
+
+  function renderBanner() {
+    if (!cstate.result) { els.banner.hidden = true; return; }
+    if (cstate.expired) {
+      const ctx = cstate.ctx;
+      els.banner.hidden = false;
+      els.banner.innerHTML =
+        `<strong>结果已过期</strong>：该结果基于会话修订 #${ctx.revision} 的 A 段帧范围 ` +
+        `${ctx.start}–${ctx.end}（${ctx.end - ctx.start} 帧）。当前选择或进度已变化，` +
+        "请重新对读以获取新结论；下表内容保留但不再作为当前证据。";
+    } else {
+      els.banner.hidden = true;
+      els.banner.textContent = "";
+    }
+  }
+
+  // --------------------------------------------------------------- rendering
+
+  function statusLabel(status) {
+    if (status === "ok") return { text: "可对应", cls: "good" };
+    if (status === "conflict") return { text: "存在冲突", cls: "bad" };
+    return { text: "证据不足", cls: "warn" };
+  }
+
+  function renderResult(payload) {
+    cstate.result = payload;
+    els.result.hidden = false;
+    renderBanner();
+
+    const st = statusLabel(payload.status);
+    const sim = payload.similarity === null || payload.similarity === undefined
+      ? "—"
+      : payload.similarity.toFixed(4);
+    const parts = payload.score_parts || {};
+    const seg = payload.segment_a || {};
+    const cards = [
+      { k: "结论", v: st.text, cls: st.cls },
+      { k: "相似度（0～1）", v: sim, cls: payload.status === "ok" ? "good" : "muted" },
+      { k: "事件对应", v: `${parts.matched_events ?? "—"} / ${parts.total_events ?? "—"}`, cls: "muted" },
+      { k: "A 段长度 / B 段长度", v: `${seg.length ?? payload.lengths.a} / ${payload.lengths.b}`, cls: "muted" },
+    ];
+    els.summary.innerHTML = "";
+    cards.forEach((card) => {
+      const div = document.createElement("div");
+      div.className = "cmp-card";
+      const k = document.createElement("span");
+      k.className = "k";
+      k.textContent = card.k;
+      const v = document.createElement("span");
+      v.className = `v ${card.cls}`;
+      v.textContent = String(card.v);
+      div.append(k, v);
+      els.summary.appendChild(div);
+    });
+
+    if (payload.reason) {
+      els.reason.hidden = false;
+      els.reason.textContent = payload.reason;
+    } else {
+      els.reason.hidden = true;
+      els.reason.textContent = "";
+    }
+
+    // Event pair table.
+    els.pairsBody.innerHTML = "";
+    const pairs = payload.pairs || [];
+    els.pairsEmpty.hidden = pairs.length > 0;
+    pairs.forEach((pair, idx) => {
+      const tr = document.createElement("tr");
+      if (!pair.tempo_ok) tr.className = "tempo-bad";
+      const mk = (text) => {
+        const td = document.createElement("td");
+        td.textContent = text;
+        return td;
+      };
+      tr.appendChild(mk(String(idx + 1)));
+      tr.appendChild(mk(pair.token));
+      tr.appendChild(
+        mk(
+          `${pair.a_start}-${pair.a_end}（绝对 ${seg.start_frame + pair.a_start}–` +
+            `${seg.start_frame + pair.a_end}）`
+        )
+      );
+      tr.appendChild(mk(`${pair.b_start}-${pair.b_end}`));
+      tr.appendChild(mk(`${pair.a_frame_count} ↔ ${pair.b_frame_count}`));
+      const speed = document.createElement("td");
+      speed.className = "num";
+      speed.textContent = pair.speed_ratio.toFixed(2) + "x";
+      tr.appendChild(speed);
+      const stateTd = document.createElement("td");
+      const pill = document.createElement("span");
+      if (pair.label_match && pair.tempo_ok) {
+        pill.className = "pill ok";
+        pill.textContent = "对应";
+      } else if (!pair.label_match) {
+        pill.className = "pill bad";
+        pill.textContent = "发音冲突";
+        tr.classList.add("pair-conflict");
+      } else {
+        pill.className = "pill bad";
+        pill.textContent = "速度超限";
+      }
+      stateTd.appendChild(pill);
+      tr.appendChild(stateTd);
+      els.pairsBody.appendChild(tr);
+    });
+
+    // Conflicts.
+    els.conflicts.innerHTML = "";
+    const conflictList = payload.conflicts || [];
+    els.conflictsEmpty.hidden = conflictList.length > 0;
+    conflictList.forEach((c) => {
+      const li = document.createElement("li");
+      const tag = document.createElement("span");
+      tag.className = "ctype";
+      tag.textContent = c.type;
+      li.append(tag, document.createTextNode(c.message));
+      els.conflicts.appendChild(li);
+    });
+
+    renderAlignment(payload);
+
+    const ctx = cstate.ctx;
+    els.meta.textContent =
+      `请求 ${payload.request_id || "—"} · 会话修订 #${payload.revision} · ` +
+      `A 段原帧范围 ${ctx.start}–${ctx.end}（绝对） · B 段来源：${ctx.bFileName || "内置样例"} · ` +
+      `对齐路径 ${payload.alignment.length} 个对应帧`;
+  }
+
+  function kindLabel(kind) {
+    if (kind === "event") return "发音";
+    if (kind === "blank") return "blank";
+    return "模糊";
+  }
+
+  function renderAlignment(payload) {
+    els.align.innerHTML = "";
+    const seg = payload.segment_a || { start_frame: 0 };
+    const path = payload.alignment || [];
+    if (!path.length) {
+      const empty = document.createElement("span");
+      empty.className = "hint";
+      empty.textContent = "无可用对齐路径。";
+      els.align.appendChild(empty);
+      return;
+    }
+    path.forEach((step) => {
+      const row = document.createElement("div");
+      const ka = payload.frame_kinds_a[step.a];
+      const kb = payload.frame_kinds_b[step.b];
+      row.className = `arow kind-${ka === kb ? ka : "ambiguous"}`;
+      row.textContent =
+        `A[${step.a}] 绝对帧 ${seg.start_frame + step.a}（${kindLabel(ka)}）  ↔  ` +
+        `B[${step.b}]（${kindLabel(kb)}）`;
+      els.align.appendChild(row);
+    });
+  }
+
+  // ------------------------------------------------------------------- run
+
+  function readBFile(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        let raw;
+        try {
+          raw = JSON.parse(reader.result);
+        } catch (err) {
+          reject(new Error(`B 段 JSON 解析失败：${err.message}`));
+          return;
+        }
+        if (Array.isArray(raw)) { resolve(raw); return; }
+        if (raw && Array.isArray(raw.frames)) { resolve(raw.frames); return; }
+        if (raw && Array.isArray(raw.probs)) { resolve(raw.probs); return; }
+        reject(new Error("B 段文件必须是帧数组，或含 frames / probs 字段的对象"));
+      };
+      reader.onerror = () => reject(new Error("B 段文件读取失败"));
+      reader.readAsText(file);
+    });
+  }
+
+  async function runCompare() {
+    const { sessionId, generation, snapshot } = currentSession();
+    if (!sessionId || !snapshot) {
+      showError("请先创建会话并推进帧");
+      return;
+    }
+    const start = Number(els.start.value);
+    const end = Number(els.end.value);
+    let framesB;
+    let bFileName = cstate.sampleB ? "内置对读样例" : "";
+    if (cstate.sampleB) {
+      framesB = cstate.sampleB;
+    } else {
+      const file = els.bFile.files[0];
+      if (!file) { showError("请选择 B 段概率文件，或点击内置对读样例"); return; }
+      bFileName = file.name;
+      try {
+        framesB = await readBFile(file);
+      } catch (err) {
+        showError(err.message);
+        return;
+      }
+    }
+
+    const requestId = `cmp-${Date.now()}-${++cstate.requestSeq}`;
+    cstate.lastRequestId = requestId;
+    showError("");
+    els.run.disabled = true;
+    els.run.textContent = "对读计算中…";
+    try {
+      const payload = await api("/api/compare", {
+        method: "POST",
+        body: JSON.stringify({
+          session_id: sessionId,
+          start_frame: start,
+          end_frame: end,
+          frames_b: framesB,
+          request_id: requestId,
+        }),
+      });
+      // Late response: a newer comparison has been started, or the session was
+      // replaced.  Never overwrite the newer result.
+      if (payload.request_id !== cstate.lastRequestId) return;
+      const live = currentSession();
+      if (payload.session_id !== live.sessionId) return;
+      cstate.ctx = {
+        sessionId,
+        generation,
+        revision: payload.revision,
+        start,
+        end,
+        bFileName,
+      };
+      cstate.expired = false;
+      renderResult(payload);
+    } catch (err) {
+      // Failure must preserve the previous result (if any); show the reason.
+      if (cstate.result) {
+        showError(`对读失败，已保留上次结果：${err.message}`);
+      } else {
+        showError(`对读失败：${err.message}`);
+      }
+    } finally {
+      els.run.textContent = "开始对读";
+      updateRunButton();
+    }
+  }
+
+  // -------------------------------------------------------------- demo samples
+
+  async function loadCompareSamples() {
+    try {
+      const payload = await api("/api/compare-samples");
+      const items = payload.samples || [];
+      els.samples.innerHTML = "";
+      items.forEach((item) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "sample ghost";
+        btn.textContent = item.title || item.name;
+        btn.title = item.description || item.name;
+        btn.addEventListener("click", () => loadPairSample(item.name, btn));
+        els.samples.appendChild(btn);
+      });
+    } catch {
+      /* samples are optional */
+    }
+  }
+
+  async function loadPairSample(name, btn) {
+    try {
+      const data = await api(`/api/compare-samples/${encodeURIComponent(name)}`);
+      cstate.sampleB = data.frames_b || data.frames;
+      els.bFile.value = "";
+      const range = data.suggested_range;
+      const { snapshot } = currentSession();
+      if (Array.isArray(range) && snapshot && range[1] <= snapshot.next_frame) {
+        els.start.value = String(range[0]);
+        els.end.value = String(range[1]);
+      }
+      clampRange();
+      showError("");
+      [...els.samples.children].forEach((b) => (b.style.borderColor = ""));
+      btn.style.borderColor = "var(--accent)";
+      updateRunButton();
+    } catch (err) {
+      showError(`载入对读样例失败：${err.message}`);
+    }
+  }
+
+  // ------------------------------------------------------------------ wiring
+
+  els.start.addEventListener("input", clampRange);
+  els.end.addEventListener("input", clampRange);
+  els.bFile.addEventListener("change", () => {
+    cstate.sampleB = null;
+    [...els.samples.children].forEach((b) => (b.style.borderColor = ""));
+    showError("");
+    updateRunButton();
+  });
+  els.run.addEventListener("click", runCompare);
+  els.alignToggle.addEventListener("click", () => {
+    const hidden = els.align.hidden;
+    els.align.hidden = !hidden;
+    els.alignToggle.textContent = hidden ? "收起" : "展开";
+  });
+
+  // The streaming workbench notifies us after every accepted snapshot.  A
+  // generation change means the session was replaced: drop the old result and
+  // selections.  A revision change on the same session merely expires it.
+  let lastGeneration = currentSession().generation;
+  window.CTC_WORKBENCH.onSnapshot = () => {
+    const live = currentSession();
+    if (live.generation !== lastGeneration) {
+      lastGeneration = live.generation;
+      cstate.result = null;
+      cstate.ctx = null;
+      cstate.expired = false;
+      cstate.sampleB = null;
+      els.result.hidden = true;
+      els.bFile.value = "";
+      els.start.value = "0";
+      els.end.value = String(MIN_FRAMES);
+      showError("");
+    }
+    syncRangeLimits();
+    markExpiredIfChanged();
+    updateRunButton();
+  };
+
+  syncRangeLimits();
+  updateRunButton();
+  loadCompareSamples();
 })();

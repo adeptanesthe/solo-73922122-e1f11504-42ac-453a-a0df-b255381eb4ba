@@ -24,15 +24,17 @@ from pathlib import Path
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictInt
 
 from .decoder import DecodeError
+from .compare import CompareError, compare_segments
 from . import state as state_module
 from .state import SessionError, SessionManager
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 SAMPLE_DIR = BASE_DIR.parent / "samples"
+COMPARE_SAMPLE_DIR = BASE_DIR.parent / "samples" / "pairs"
 
 app = FastAPI(title="流式 CTC 解码工作台", version="1.0.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -66,6 +68,17 @@ class ConfirmBody(BaseModel):
 
 class UndoBody(BaseModel):
     session_id: str
+
+
+class CompareBody(BaseModel):
+    session_id: str
+    # StrictInt rejects JSON booleans (which otherwise coerce to 0/1).
+    start_frame: StrictInt
+    end_frame: StrictInt
+    # A bare frame array or a {"frames" | "probs": [...]} wrapper; validated
+    # properly inside the endpoint via _extract_b_frames.
+    frames_b: list | dict
+    request_id: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +280,100 @@ async def undo_endpoint(body: UndoBody) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Two-segment duplicate check
+# ---------------------------------------------------------------------------
+
+
+def _validate_range(session, start_frame: int, end_frame: int) -> None:
+    """The A segment must be a contiguous range of already-advanced frames."""
+    from .compare import MAX_SEGMENT_FRAMES, MIN_SEGMENT_FRAMES
+
+    if isinstance(start_frame, bool) or isinstance(end_frame, bool) or not all(
+        isinstance(v, int) for v in (start_frame, end_frame)
+    ):
+        raise SessionError("帧边界必须是整数")
+    if start_frame < 0 or end_frame > session.next_frame:
+        raise SessionError("只能从已经推进过的帧中选择 A 段")
+    length = end_frame - start_frame
+    if not (MIN_SEGMENT_FRAMES <= length <= MAX_SEGMENT_FRAMES):
+        raise SessionError(f"A 段必须是连续 {MIN_SEGMENT_FRAMES}～{MAX_SEGMENT_FRAMES} 帧")
+
+
+def _extract_b_frames(raw):
+    """Accept a bare array, ``{"frames": [...]}`` or ``{"probs": [...]}``."""
+    if isinstance(raw, dict):
+        raw = raw.get("frames", raw.get("probs"))
+    if not isinstance(raw, list) or not raw:
+        raise CompareError("B 段帧 JSON 必须是非空数组（或含 frames/probs 字段的对象）")
+    return raw
+
+
+async def _run_compare(session, start_frame, end_frame, frames_b, request_id):
+    def run(sess):
+        _validate_range(sess, start_frame, end_frame)
+        segment_a = sess.probs[start_frame:end_frame]
+        result = compare_segments(segment_a, frames_b, sess.vocab)
+        result["request_id"] = request_id
+        result["session_id"] = sess.id
+        result["revision"] = sess.revision
+        result["segment_a"] = {
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "length": end_frame - start_frame,
+            "next_frame": sess.next_frame,
+        }
+        return result
+
+    future = manager.submit(session, run)
+    try:
+        return await asyncio.wrap_future(future)
+    except SessionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except CompareError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/compare")
+async def compare_endpoint(body: CompareBody) -> dict:
+    session = _session_or_404(body.session_id)
+    try:
+        frames_b = _extract_b_frames(body.frames_b)
+    except CompareError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await _run_compare(
+        session, body.start_frame, body.end_frame, frames_b, body.request_id
+    )
+
+
+@app.post("/api/compare/upload")
+async def compare_upload_endpoint(
+    session_id: str = Form(...),
+    start_frame: int = Form(...),
+    end_frame: int = Form(...),
+    request_id: str | None = Form(None),
+    frames_b_file: UploadFile = File(..., description="B 段逐帧概率 JSON"),
+) -> dict:
+    session = _session_or_404(session_id)
+    try:
+        text = (await frames_b_file.read()).decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="文件必须是 UTF-8 编码") from exc
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"B 段帧文件 JSON 解析失败：{exc}"
+        ) from exc
+    try:
+        frames_b = _extract_b_frames(raw)
+    except CompareError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return await _run_compare(
+        session, start_frame, end_frame, frames_b, request_id
+    )
+
+
+# ---------------------------------------------------------------------------
 # Bundled samples
 
 
@@ -284,4 +391,31 @@ async def get_sample(name: str) -> JSONResponse:
     path = (SAMPLE_DIR / name).resolve()
     if path.parent != SAMPLE_DIR.resolve() or not path.is_file():
         raise HTTPException(status_code=404, detail="样例不存在")
+    return JSONResponse(json.loads(path.read_text(encoding="utf-8")))
+
+
+@app.get("/api/compare-samples")
+async def list_compare_samples() -> dict:
+    """Bundled two-segment comparison demos under ``samples/pairs``."""
+    items = []
+    if COMPARE_SAMPLE_DIR.is_dir():
+        for path in sorted(COMPARE_SAMPLE_DIR.glob("*.json")):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            items.append(
+                {
+                    "name": path.name,
+                    "title": payload.get("title", path.name),
+                    "description": payload.get("description", ""),
+                }
+            )
+    return {"samples": items}
+
+
+@app.get("/api/compare-samples/{name}")
+async def get_compare_sample(name: str) -> JSONResponse:
+    if not COMPARE_SAMPLE_DIR.is_dir():
+        raise HTTPException(status_code=404, detail="对读样例不存在")
+    path = (COMPARE_SAMPLE_DIR / name).resolve()
+    if path.parent != COMPARE_SAMPLE_DIR.resolve() or not path.is_file():
+        raise HTTPException(status_code=404, detail="对读样例不存在")
     return JSONResponse(json.loads(path.read_text(encoding="utf-8")))
